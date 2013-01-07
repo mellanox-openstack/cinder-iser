@@ -1,0 +1,37 @@
+--- iscsi.py	2013-01-07 18:33:13.655271892 +0200
++++ iscsi.py	2013-01-07 19:41:15.979714000 +0200
+@@ -36,6 +36,9 @@
+         cfg.StrOpt('volumes_dir',
+                    default='$state_path/volumes',
+                    help='Volume configuration file storage directory'),
++        cfg.StrOpt('transport',
++                    default='iscsi',
++                    help='Volume transport protocol configuration'),
+ ]
+ 
+ FLAGS = flags.FLAGS
+@@ -112,11 +115,19 @@
+         utils.ensure_tree(FLAGS.volumes_dir)
+ 
+         vol_id = name.split(':')[1]
+-        volume_conf = """
+-            <target %s>
+-                backing-store %s
+-            </target>
+-        """ % (name, path)
++        if FLAGS.transport == 'iser':
++            volume_conf = """
++                <target %s>
++                    driver iser
++                    backing-store %s
++                </target>
++            """ % (name, path)
++        else:
++            volume_conf = """
++                <target %s>
++                    backing-store %s
++                </target>
++            """ % (name, path)
+ 
+         LOG.info(_('Creating volume: %s') % vol_id)
+         volumes_dir = FLAGS.volumes_dir

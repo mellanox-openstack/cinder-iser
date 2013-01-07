@@ -1,0 +1,37 @@
+--- volume.py	2013-01-07 18:34:59.000000000 +0200
++++ volume.py	2013-01-07 19:20:38.992574000 +0200
+@@ -26,6 +26,7 @@
+ from nova import utils
+ from nova.virt.libvirt import config
+ from nova.virt.libvirt import utils as virtutils
++from glob import glob
+ 
+ LOG = logging.getLogger(__name__)
+ FLAGS = flags.FLAGS
+@@ -144,6 +145,10 @@
+                                   "node.session.auth.password",
+                                   iscsi_properties['auth_password'])
+ 
++        if iscsi_properties['transport'] == 'iser':
++            self._iscsiadm_update(iscsi_properties, "iface.transport_name", "iser")
++            self._iscsiadm_update(iscsi_properties, "node.conn[0].iscsi.HeaderDigest", "None")
++
+         # NOTE(vish): If we have another lun on the same target, we may
+         #             have a duplicate login
+         self._run_iscsiadm(iscsi_properties, ("--login",),
+@@ -156,6 +161,15 @@
+                          iscsi_properties['target_iqn'],
+                          iscsi_properties.get('target_lun', 0)))
+ 
++        if not os.path.exists(host_device):
++            device = ("ip-%s-iscsi-%s-lun-%s" %
++                       (iscsi_properties['target_portal'],
++                        iscsi_properties['target_iqn'],
++                        iscsi_properties.get('target_lun', 0)))
++            look_for_device = glob('/dev/disk/by-path/*%s' % device)
++            if look_for_device:
++                host_device = look_for_device[0]
++
+         # The /dev/disk/by-path/... node is not always present immediately
+         # TODO(justinsb): This retry-with-delay is a pattern, move to utils?
+         tries = 0

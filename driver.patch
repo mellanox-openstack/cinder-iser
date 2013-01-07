@@ -1,0 +1,50 @@
+--- driver.py	2013-01-07 18:33:22.719398603 +0200
++++ driver.py	2013-01-07 18:43:23.262023000 +0200
+@@ -58,6 +58,12 @@
+     cfg.IntOpt('iscsi_port',
+                default=3260,
+                help='The port that the iSCSI daemon is listening on'),
++    cfg.StrOpt('iser_ip_address',
++                default='$my_ip',
++                help='use this ip for iser'),
++    cfg.IntOpt('iser_port',
++                default=3260,
++                help='The port that the iSER daemon is listening on'),                                  
+     cfg.StrOpt('rbd_pool',
+                default='rbd',
+                help='the RADOS pool in which rbd volumes are stored'),
+@@ -435,8 +441,12 @@
+                                               iscsi_target,
+                                               0,
+                                               volume_path)
+-        model_update['provider_location'] = _iscsi_location(
+-            FLAGS.iscsi_ip_address, tid, iscsi_name, lun)
++        if FLAGS.transport == 'iser':
++            model_update['provider_location'] = _iscsi_location(
++                FLAGS.iser_ip_address, tid, iscsi_name, lun)
++        else:
++            model_update['provider_location'] = _iscsi_location(
++                FLAGS.iscsi_ip_address, tid, iscsi_name, lun)
+         return model_update
+ 
+     def remove_export(self, context, volume):
+@@ -484,7 +494,8 @@
+                                     '-t', 'sendtargets', '-p', volume['host'],
+                                     run_as_root=True)
+         for target in out.splitlines():
+-            if FLAGS.iscsi_ip_address in target and volume_name in target:
++            if ((FLAGS.iscsi_ip_address in target or FLAGS.iser_ip_address in target)
++                and volume_name in target):
+                 return target
+         return None
+ 
+@@ -543,6 +554,9 @@
+ 
+         properties['volume_id'] = volume['id']
+ 
++        if FLAGS.transport == 'iser':
++            properties['transport'] = 'iser'
++
+         auth = volume['provider_auth']
+         if auth:
+             (auth_method, auth_username, auth_secret) = auth.split()
