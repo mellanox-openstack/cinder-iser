@@ -1,0 +1,13 @@
+--- a/cinder/volume/manager.py
++++ b/cinder/volume/manager.py
+@@ -103,7 +103,9 @@
+     'cinder.volume.zadara.ZadaraVPSAISCSIDriver':
+     'cinder.volume.drivers.zadara.ZadaraVPSAISCSIDriver',
+     'cinder.volume.driver.ISCSIDriver':
+-    'cinder.volume.drivers.lvm.LVMISCSIDriver'}
++    'cinder.volume.drivers.lvm.LVMISCSIDriver',
++    'cinder.volume.driver.ISERDriver':
++    'cinder.volume.drivers.lvm.LVMISERDriver'}
+ 
+ 
+ class VolumeManager(manager.SchedulerDependentManager):

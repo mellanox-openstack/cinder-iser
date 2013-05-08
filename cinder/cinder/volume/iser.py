@@ -16,39 +16,40 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 """
-Helper code for the iSCSI volume driver.
+Helper code for the iSER volume driver.
 
 """
 import os
+import re
+
+from oslo.config import cfg
 
 from cinder import exception
 from cinder import flags
-from cinder.openstack.common import cfg
 from cinder.openstack.common import log as logging
 from cinder import utils
 
 LOG = logging.getLogger(__name__)
 
-iscsi_helper_opt = [
-        cfg.StrOpt('iscsi_helper',
-                    default='tgtadm',
-                    help='iscsi target user-land tool to use'),
-        cfg.StrOpt('volumes_dir',
-                   default='$state_path/volumes',
-                   help='Volume configuration file storage directory'),
-        cfg.StrOpt('transport',
-                    default='iscsi',
-                    help='Volume transport protocol configuration'),
-]
+iser_helper_opt = [cfg.StrOpt('iser_helper',
+                              default='tgtadm',
+                              help='iser target user-land tool to use'),
+                   cfg.StrOpt('volumes_dir',
+                              default='$state_path/volumes',
+                              help='Volume configuration file storage '
+                                   'directory'
+                              )
+                   ]
 
 FLAGS = flags.FLAGS
-FLAGS.register_opts(iscsi_helper_opt)
+FLAGS.register_opts(iser_helper_opt)
+FLAGS.import_opt('volume_name_template', 'cinder.db')
 
 
 class TargetAdmin(object):
-    """iSCSI target administration.
+    """iSER target administration.
 
-    Base class for iSCSI target admin helpers.
+    Base class for iSER target admin helpers.
     """
 
     def __init__(self, cmd, execute):
@@ -62,16 +63,17 @@ class TargetAdmin(object):
     def _run(self, *args, **kwargs):
         self._execute(self._cmd, *args, run_as_root=True, **kwargs)
 
-    def create_iscsi_target(self, name, tid, lun, path, **kwargs):
-        """Create a iSCSI target and logical unit"""
+    def create_iser_target(self, name, tid, lun, path,
+                           chap_auth=None, **kwargs):
+        """Create a iSER target and logical unit"""
         raise NotImplementedError()
 
-    def remove_iscsi_target(self, tid, lun, vol_id, **kwargs):
-        """Remove a iSCSI target and logical unit"""
+    def remove_iser_target(self, tid, lun, vol_id, **kwargs):
+        """Remove a iSER target and logical unit"""
         raise NotImplementedError()
 
     def _new_target(self, name, tid, **kwargs):
-        """Create a new iSCSI target."""
+        """Create a new iSER target."""
         raise NotImplementedError()
 
     def _delete_target(self, tid, **kwargs):
@@ -92,7 +94,7 @@ class TargetAdmin(object):
 
 
 class TgtAdm(TargetAdmin):
-    """iSCSI target administration using tgtadm."""
+    """iSER target administration using tgtadm."""
 
     def __init__(self, execute=utils.execute):
         super(TgtAdm, self).__init__('tgtadm', execute)
@@ -108,14 +110,15 @@ class TgtAdm(TargetAdmin):
 
         return None
 
-    def create_iscsi_target(self, name, tid, lun, path, **kwargs):
+    def create_iser_target(self, name, tid, lun, path,
+                           chap_auth=None, **kwargs):
         # Note(jdg) tid and lun aren't used by TgtAdm but remain for
         # compatibility
 
         utils.ensure_tree(FLAGS.volumes_dir)
 
         vol_id = name.split(':')[1]
-        if FLAGS.transport == 'iser':
+        if chap_auth is None:
             volume_conf = """
                 <target %s>
                     driver iser
@@ -125,11 +128,13 @@ class TgtAdm(TargetAdmin):
         else:
             volume_conf = """
                 <target %s>
+                    driver iser
                     backing-store %s
+                    %s
                 </target>
-            """ % (name, path)
+            """ % (name, path, chap_auth)
 
-        LOG.info(_('Creating volume: %s') % vol_id)
+        LOG.info(_('Creating iser_target for: %s') % vol_id)
         volumes_dir = FLAGS.volumes_dir
         volume_path = os.path.join(volumes_dir, vol_id)
 
@@ -148,17 +153,17 @@ class TgtAdm(TargetAdmin):
                                        name,
                                        run_as_root=True)
         except exception.ProcessExecutionError, e:
-            LOG.error(_("Failed to create iscsi target for volume "
+            LOG.error(_("Failed to create iser target for volume "
                         "id:%(vol_id)s.") % locals())
 
             #Don't forget to remove the persistent file we created
             os.unlink(volume_path)
-            raise exception.ISCSITargetCreateFailed(volume_id=vol_id)
+            raise exception.ISERTargetCreateFailed(volume_id=vol_id)
 
-        iqn = '%s%s' % (FLAGS.iscsi_target_prefix, vol_id)
+        iqn = '%s%s' % (FLAGS.iser_target_prefix, vol_id)
         tid = self._get_target(iqn)
         if tid is None:
-            LOG.error(_("Failed to create iscsi target for volume "
+            LOG.error(_("Failed to create iser target for volume "
                         "id:%(vol_id)s. Please ensure your tgtd config file "
                         "contains 'include %(volumes_dir)s/*'") % locals())
             raise exception.NotFound()
@@ -168,24 +173,27 @@ class TgtAdm(TargetAdmin):
 
         return tid
 
-    def remove_iscsi_target(self, tid, lun, vol_id, **kwargs):
-        LOG.info(_('Removing volume: %s') % vol_id)
-        vol_uuid_file = 'volume-%s' % vol_id
+    def remove_iser_target(self, tid, lun, vol_id, **kwargs):
+        LOG.info(_('Removing iser_target for: %s') % vol_id)
+        vol_uuid_file = FLAGS.volume_name_template % vol_id
         volume_path = os.path.join(FLAGS.volumes_dir, vol_uuid_file)
         if os.path.isfile(volume_path):
-            iqn = '%s%s' % (FLAGS.iscsi_target_prefix,
+            iqn = '%s%s' % (FLAGS.iser_target_prefix,
                             vol_uuid_file)
         else:
-            raise exception.ISCSITargetRemoveFailed(volume_id=vol_id)
+            raise exception.ISERTargetRemoveFailed(volume_id=vol_id)
         try:
+            # NOTE(vish): --force is a workaround for bug:
+            #             https://bugs.launchpad.net/cinder/+bug/1159948
             self._execute('tgt-admin',
+                          '--force',
                           '--delete',
                           iqn,
                           run_as_root=True)
         except exception.ProcessExecutionError, e:
-            LOG.error(_("Failed to delete iscsi target for volume "
-                        "id:%(volume_id)s.") % locals())
-            raise exception.ISCSITargetRemoveFailed(volume_id=vol_id)
+            LOG.error(_("Failed to remove iser target for volume "
+                        "id:%(vol_id)s.") % locals())
+            raise exception.ISERTargetRemoveFailed(volume_id=vol_id)
 
         os.unlink(volume_path)
 
@@ -199,54 +207,21 @@ class TgtAdm(TargetAdmin):
             raise exception.NotFound()
 
 
-class IetAdm(TargetAdmin):
-    """iSCSI target administration using ietadm."""
+class FakeIserHelper(object):
 
-    def __init__(self, execute=utils.execute):
-        super(IetAdm, self).__init__('ietadm', execute)
+    def __init__(self):
+        self.tid = 1
 
-    def create_iscsi_target(self, name, tid, lun, path, **kwargs):
-        self._new_target(name, tid, **kwargs)
-        self._new_logicalunit(tid, lun, path, **kwargs)
-        return tid
+    def set_execute(self, execute):
+        self._execute = execute
 
-    def remove_iscsi_target(self, tid, lun, vol_id, **kwargs):
-        LOG.info(_('Removing volume: %s') % vol_id)
-        self._delete_logicalunit(tid, lun, **kwargs)
-        self._delete_target(tid, **kwargs)
-
-    def _new_target(self, name, tid, **kwargs):
-        self._run('--op', 'new',
-                  '--tid=%s' % tid,
-                  '--params', 'Name=%s' % name,
-                  **kwargs)
-
-    def _delete_target(self, tid, **kwargs):
-        self._run('--op', 'delete',
-                  '--tid=%s' % tid,
-                  **kwargs)
-
-    def show_target(self, tid, iqn=None, **kwargs):
-        self._run('--op', 'show',
-                  '--tid=%s' % tid,
-                  **kwargs)
-
-    def _new_logicalunit(self, tid, lun, path, **kwargs):
-        self._run('--op', 'new',
-                  '--tid=%s' % tid,
-                  '--lun=%d' % lun,
-                  '--params', 'Path=%s,Type=fileio' % path,
-                  **kwargs)
-
-    def _delete_logicalunit(self, tid, lun, **kwargs):
-        self._run('--op', 'delete',
-                  '--tid=%s' % tid,
-                  '--lun=%d' % lun,
-                  **kwargs)
+    def create_iser_target(self, *args, **kwargs):
+        self.tid += 1
+        return self.tid
 
 
 def get_target_admin():
-    if FLAGS.iscsi_helper == 'tgtadm':
+    if FLAGS.iser_helper == 'tgtadm':
         return TgtAdm()
-    else:
-        return IetAdm()
+    elif FLAGS.iser_helper == 'fake':
+        return FakeIserHelper()

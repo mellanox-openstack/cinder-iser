@@ -1,0 +1,340 @@
+--- a/cinder/volume/driver.py
++++ b/cinder/volume/driver.py
+@@ -53,10 +53,25 @@
+                help='prefix for iscsi volumes'),
+     cfg.StrOpt('iscsi_ip_address',
+                default='$my_ip',
+-               help='The port that the iSCSI daemon is listening on'),
++               help='The IP address that the iSCSI daemon is listening on'),
+     cfg.IntOpt('iscsi_port',
+                default=3260,
+                help='The port that the iSCSI daemon is listening on'),
++    cfg.IntOpt('num_iser_scan_tries',
++               default=3,
++               help='number of times to rescan iSER target to find volume'),
++    cfg.IntOpt('iser_num_targets',
++               default=100,
++               help='Number of iser target ids per host'),
++    cfg.StrOpt('iser_target_prefix',
++               default='iqn.2010-10.org.iser.openstack:',
++               help='prefix for iser volumes'),
++    cfg.StrOpt('iser_ip_address',
++               default='$my_ip',
++               help='The IP address that the iSER daemon is listening on'),
++    cfg.IntOpt('iser_port',
++               default=3260,
++               help='The port that the iSER daemon is listening on'),
+     cfg.StrOpt('volume_backend_name',
+                default=None,
+                help='The backend name for a given driver implementation'), ]
+@@ -64,6 +79,7 @@
+ FLAGS = flags.FLAGS
+ FLAGS.register_opts(volume_opts)
+ FLAGS.import_opt('iscsi_helper', 'cinder.volume.iscsi')
++FLAGS.import_opt('iser_helper', 'cinder.volume.iser')
+ 
+ 
+ class VolumeDriver(object):
+@@ -194,6 +210,293 @@
+         raise NotImplementedError()
+ 
+ 
++class ISERDriver(VolumeDriver):
++    """Executes commands relating to ISER volumes.
++
++    We make use of model provider properties as follows:
++
++    ``provider_location``
++      if present, contains the iSER target information in the same
++      format as an ietadm discovery
++      i.e. '<ip>:<port>,<portal> <target IQN>'
++
++    ``provider_auth``
++      if present, contains a space-separated triple:
++      '<auth method> <auth username> <auth password>'.
++      `CHAP` is the only auth_method in use at the moment.
++    """
++
++    def __init__(self, *args, **kwargs):
++        super(ISERDriver, self).__init__(*args, **kwargs)
++
++    def _do_iser_discovery(self, volume):
++        #TODO(justinsb): Deprecate discovery and use stored info
++        #NOTE(justinsb): Discovery won't work with CHAP-secured targets (?)
++        LOG.warn(_("ISER provider_location not stored, using discovery"))
++
++        volume_name = volume['name']
++
++        (out, _err) = self._execute('iscsiadm', '-m', 'discovery',
++                                    '-t', 'sendtargets', '-p', volume['host'],
++                                    run_as_root=True)
++        for target in out.splitlines():
++            if (self.configuration.iser_ip_address in target
++                    and volume_name in target):
++                return target
++        return None
++
++    def _get_iser_properties(self, volume):
++        """Gets iser configuration
++
++        We ideally get saved information in the volume entity, but fall back
++        to discovery if need be. Discovery may be completely removed in future
++        The properties are:
++
++        :target_discovered:    boolean indicating whether discovery was used
++
++        :target_iqn:    the IQN of the iSER target
++
++        :target_portal:    the portal of the iSER target
++
++        :target_lun:    the lun of the iSER target
++
++        :volume_id:    the id of the volume (currently used by xen)
++
++        :auth_method:, :auth_username:, :auth_password:
++
++            the authentication details. Right now, either auth_method is not
++            present meaning no authentication, or auth_method == `CHAP`
++            meaning use CHAP with the specified credentials.
++        """
++
++        properties = {}
++
++        location = volume['provider_location']
++
++        if location:
++            # provider_location is the same format as iSER discovery output
++            properties['target_discovered'] = False
++        else:
++            location = self._do_iser_discovery(volume)
++
++            if not location:
++                msg = (_("Could not find iSER export for volume %s") %
++                        (volume['name']))
++                raise exception.InvalidVolume(reason=msg)
++
++            LOG.debug(_("ISER Discovery: Found %s") % (location))
++            properties['target_discovered'] = True
++
++        results = location.split(" ")
++        properties['target_portal'] = results[0].split(",")[0]
++        properties['target_iqn'] = results[1]
++        try:
++            properties['target_lun'] = int(results[2])
++        except (IndexError, ValueError):
++            if (self.configuration.volume_driver in
++                    ['cinder.volume.drivers.lvm.LVMISERDriver',
++                     'cinder.volume.drivers.lvm.ThinLVMVolumeDriver'] and
++                    self.configuration.iser_helper == 'tgtadm'):
++                properties['target_lun'] = 1
++            else:
++                properties['target_lun'] = 0
++
++        properties['volume_id'] = volume['id']
++        properties['transport'] = 'iser'
++
++        auth = volume['provider_auth']
++        if auth:
++            (auth_method, auth_username, auth_secret) = auth.split()
++
++            properties['auth_method'] = auth_method
++            properties['auth_username'] = auth_username
++            properties['auth_password'] = auth_secret
++
++        return properties
++
++    def _run_iscsiadm(self, iser_properties, iser_command, **kwargs):
++        check_exit_code = kwargs.pop('check_exit_code', 0)
++        (out, err) = self._execute('iscsiadm', '-m', 'node', '-T',
++                                   iser_properties['target_iqn'],
++                                   '-p', iser_properties['target_portal'],
++                                   *iser_command, run_as_root=True,
++                                   check_exit_code=check_exit_code)
++        LOG.debug("iscsiadm %s: stdout=%s stderr=%s" %
++                  (iser_command, out, err))
++        return (out, err)
++
++    def _iscsiadm_update(self, iser_properties, property_key, property_value,
++                         **kwargs):
++        iser_command = ('--op', 'update', '-n', property_key,
++                        '-v', property_value)
++        return self._run_iscsiadm(iser_properties, iser_command, **kwargs)
++
++    def initialize_connection(self, volume, connector):
++        """Initializes the connection and returns connection info.
++
++        The iser driver returns a driver_volume_type of 'iser'.
++        The format of the driver data is defined in _get_iser_properties.
++        Example return value::
++
++            {
++                'driver_volume_type': 'iser'
++                'data': {
++                    'target_discovered': True,
++                    'target_iqn':
++                    'iqn.2010-10.org.iser.openstack:volume-00000001',
++                    'target_portal': '127.0.0.0.1:3260',
++                    'volume_id': 1,
++                }
++            }
++
++        """
++
++        if self.configuration.iser_helper == 'lioadm':
++            self.tgtadm.initialize_connection(volume, connector)
++
++        iser_properties = self._get_iser_properties(volume)
++        return {
++            'driver_volume_type': 'iser',
++            'data': iser_properties
++        }
++
++    def terminate_connection(self, volume, connector, **kwargs):
++        pass
++
++    def _get_iser_initiator(self):
++        """Get iser initiator name for this machine"""
++        # NOTE openiscsi stores initiator name in a file that
++        #      needs root permission to read.
++        contents = utils.read_file_as_root('/etc/iscsi/initiatorname.iscsi')
++        for l in contents.split('\n'):
++            if l.startswith('InitiatorName='):
++                return l[l.index('=') + 1:].strip()
++
++    def copy_image_to_volume(self, context, volume, image_service, image_id):
++        """Fetch the image from image_service and write it to the volume."""
++        LOG.debug(_('copy_image_to_volume %s.') % volume['name'])
++        connector = {'initiator': self._get_iser_initiator(),
++                     'host': socket.gethostname()}
++
++        iser_properties, volume_path = self._attach_volume(
++            context, volume, connector)
++
++        try:
++            image_utils.fetch_to_raw(context,
++                                     image_service,
++                                     image_id,
++                                     volume_path)
++        finally:
++            self.terminate_connection(volume, connector)
++
++    def copy_volume_to_image(self, context, volume, image_service, image_meta):
++        """Copy the volume to the specified image."""
++        LOG.debug(_('copy_volume_to_image %s.') % volume['name'])
++        connector = {'initiator': self._get_iser_initiator(),
++                     'host': socket.gethostname()}
++
++        iser_properties, volume_path = self._attach_volume(
++            context, volume, connector)
++
++        try:
++            image_utils.upload_volume(context,
++                                      image_service,
++                                      image_meta,
++                                      volume_path)
++        finally:
++            self.terminate_connection(volume, connector)
++
++    def _attach_volume(self, context, volume, connector):
++        """Attach the volume."""
++        iser_properties = None
++        host_device = None
++        init_conn = self.initialize_connection(volume, connector)
++        iser_properties = init_conn['data']
++
++        # code "inspired by" nova/virt/libvirt/volume.py
++        try:
++            self._run_iscsiadm(iser_properties, ())
++        except exception.ProcessExecutionError as exc:
++            # iscsiadm returns 21 for "No records found" after version 2.0-871
++            if exc.exit_code in [21, 255]:
++                self._run_iscsiadm(iser_properties, ('--op', 'new'))
++            else:
++                raise
++
++        if iser_properties.get('auth_method'):
++            self._iscsiadm_update(iser_properties,
++                                  "node.session.auth.authmethod",
++                                  iser_properties['auth_method'])
++            self._iscsiadm_update(iser_properties,
++                                  "node.session.auth.username",
++                                  iser_properties['auth_username'])
++            self._iscsiadm_update(iser_properties,
++                                  "node.session.auth.password",
++                                  iser_properties['auth_password'])
++
++        # NOTE(vish): If we have another lun on the same target, we may
++        #             have a duplicate login
++        self._run_iscsiadm(iser_properties, ("--login",),
++                           check_exit_code=[0, 255])
++
++        self._iscsiadm_update(iser_properties, "node.startup", "automatic")
++
++        host_device = ("/dev/disk/by-path/ip-%s-iser-%s-lun-%s" %
++                       (iser_properties['target_portal'],
++                        iser_properties['target_iqn'],
++                        iser_properties.get('target_lun', 0)))
++
++        tries = 0
++        while not os.path.exists(host_device):
++            if tries >= self.configuration.num_iser_scan_tries:
++                raise exception.CinderException(
++                    _("iSER device not found at %s") % (host_device))
++
++            LOG.warn(_("ISER volume not yet found at: %(host_device)s. "
++                     "Will rescan & retry.  Try number: %(tries)s") %
++                     locals())
++
++            # The rescan isn't documented as being necessary(?), but it helps
++            self._run_iscsiadm(iser_properties, ("--rescan",))
++
++            tries = tries + 1
++            if not os.path.exists(host_device):
++                time.sleep(tries ** 2)
++
++        if tries != 0:
++            LOG.debug(_("Found iSER node %(host_device)s "
++                      "(after %(tries)s rescans)") %
++                      locals())
++
++        return iser_properties, host_device
++
++    def get_volume_stats(self, refresh=False):
++        """Get volume status.
++
++        If 'refresh' is True, run update the stats first."""
++        if refresh:
++            self._update_volume_status()
++
++        return self._stats
++
++    def _update_volume_status(self):
++        """Retrieve status info from volume group."""
++
++        LOG.debug(_("Updating volume status"))
++        data = {}
++        backend_name = self.configuration.safe_get('volume_backend_name')
++        data["volume_backend_name"] = backend_name or 'Generic_iSER'
++        data["vendor_name"] = 'Open Source'
++        data["driver_version"] = '1.0'
++        data["storage_protocol"] = 'iSER'
++
++        data['total_capacity_gb'] = 'infinite'
++        data['free_capacity_gb'] = 'infinite'
++        data['reserved_percentage'] = 100
++        data['QoS_support'] = False
++        self._stats = data
++
++
+ class ISCSIDriver(VolumeDriver):
+     """Executes commands relating to ISCSI volumes.
+ 
+@@ -225,7 +528,7 @@
+                                     run_as_root=True)
+         for target in out.splitlines():
+             if (self.configuration.iscsi_ip_address in target
+-                and volume_name in target):
++                    and volume_name in target):
+                 return target
+         return None
+ 

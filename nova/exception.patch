@@ -1,0 +1,13 @@
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -476,6 +476,10 @@
+     message = _("No target id found for volume %(volume_id)s.")
+ 
+ 
++class ISERTargetNotFoundForVolume(NotFound):
++    message = _("No target id found for volume %(volume_id)s.")
++
++
+ class DiskNotFound(NotFound):
+     message = _("No disk at %(location)s")
+ 

@@ -1,4 +1,4 @@
-openstack - add iSER (iSCSI over RDMA) support to Cinder
+openstack(grizzly) - add iSER (iSCSI over RDMA) support to Cinder
 ========================================================
 
 This can allow 5x faster bandwidth compared to using iSCSI TCP.
@@ -10,23 +10,24 @@ The tests I ran and passed: create a volume, attach to VM, detach from VM, and d
 
 Instructions:
 
-Added two flags in "/etc/cinder/cinder.conf":
+In order to enable iSER, need to adjust these values at "/etc/cinder/cinder.conf":
 
-transport = iser (by default will be iscsi)
+iser_ip_address = <ipoib/roce_address>
 
-iser_ip_address = 192.168.20.140 (by default will be "iscsi_ip_address")
+volume_driver = cinder.volume.drivers.lvm.LVMISERDriver
 
+the first value is required to do a "discovery" over the IB/RoCE interface from the initiator side.
 
-To apply the patch, replace the files under "cinder/volume":
+the second points cinder to use the ISERDriver, instead the LVMISCSIDriver.
 
-driver.py
+Also, on nova-compute side need to adjust "/etc/nova/nova.conf":
 
-iscsi.py
-
-
-And under "nova/virt/libvirt":
-
-volume.py
+libvirt_volume_drivers = iser=nova.virt.libvirt.volume.LibvirtISERVolumeDriver
 
 
-see the patch details in "*.patch" files.
+Installation:
+
+To apply this support, replace the files under "cinder/cinder/" And "nova/nova/" Respectively.
+
+OR apply the patches under "cinder/" And "nova/", don't forget to copy "cinder/cinder/volume/iser.py" if you choose this way.
+
